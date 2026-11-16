@@ -396,7 +396,11 @@ class SimilarDifferenceTest(unittest.TestCase):
 
     def test_three_different_scenes_are_shown_and_block_recommendation(self):
         r = similar.compare(sig_from(self.base), sig_from(self.diff3))
-        self.assertEqual(r["verdict"], "similar")  # 類似候補ではあるが…
+        # 一致しない場面が 2 か所以上ある組は、類似にしない（共通のオープニング・エンディングが長い別の回を
+        # まとめないための変更。tools/eval_similar_cases.py で測定）。以前の基準（75% 以上の一致）では「類似」だった
+        self.assertEqual(r["verdict"], "different")
+        self.assertEqual(r["per_ok"].count(False), 3)
+        # 別の経路でグループに入っている場合（以前の調査結果など）でも、違う場面を示し、おすすめを決めない
         rows = self.rows([sig_from(self.base), sig_from(self.diff3)])
         det = candidates.similar_group_detail(rows, [1, 2])
         self.assertEqual(det["unmatched"], [2, 6, 9])  # どの場面が違うかを示す

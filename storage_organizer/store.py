@@ -33,7 +33,7 @@ SCHEMA_VERSION = 1  # 保存形式の版。新しい版で保存されたデー�
 DATA_DIR_NAME = "RecSortV1"
 ANALYSIS_STATES = ("未解析", "解析中", "完了", "一部失敗", "失敗")
 DECISIONS = ("残す", "削除候補", "保留", "両方残す")
-PATH_LIST_KEYS = ("extra_locations", "excluded_folders", "disabled_locations")
+PATH_LIST_KEYS = ("extra_locations", "excluded_folders", "disabled_locations", "scan_folders")
 # 解析結果（JSON 文字列で持つ項目は loads() で読む）
 ANALYSIS_FIELDS = ("analysis_state", "analysis_error", "meta", "features", "thumbs", "sha256", "taken_at", "dhash",
                    "light_state", "light_note", "failure", "vsig")
@@ -379,7 +379,7 @@ class Store:
                      "scan_started": (str,), "scan_finished": (str,), "schema_version": (int,),
                      "files_scanned": (str,), "analysis_state": (str,),
                      "view_history_started": (str,), "extra_locations": (list,), "excluded_folders": (list,),
-                     "disabled_locations": (list,), "not_scanned_drives": (list,)}
+                     "disabled_locations": (list,), "not_scanned_drives": (list,), "scan_folders": (list,)}
 
     def _sanitize_settings(self) -> None:
         """型が違う設定だけを使わない（ほかの設定は残す）。ファイルは次に保存するときに直る。"""
@@ -746,9 +746,15 @@ class Store:
                 new.append({"path": loc.path, "kind": loc.kind, "label": loc.label, "priority": loc.priority,
                             "status": "中断" if status == "調査中" else status, "files": prev.get("files", 0),
                             "bytes": prev.get("bytes", 0), "last_completed": prev.get("last_completed")})
-            for path in set(old) - {x["path"] for x in new}:
+            removed = set(old) - {x["path"] for x in new}
+            for path in removed:
                 self._scan["stats"].pop(path, None)
                 self.forget_location(path)
+            if removed:  # 調べなくなった場所の録画は一覧から外す（判断・保護・解析結果はパスごとに残る）
+                self.generation += 1
+                for r in self._rows.values():
+                    if r["location"] in removed:
+                        r["missing"] = 1
             self._scan["locations"] = new
             self.save_scan_state()
 

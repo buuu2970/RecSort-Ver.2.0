@@ -1,0 +1,4 @@
+# ブラウザ版（RecSortを起動.bat）に必要な部品だけ。デスクトップ版（PySide6）は含めない
+numpy>=1.26
+Pillow>=10.0
+pywin32>=306; sys_platform == "win32"

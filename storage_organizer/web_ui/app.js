@@ -53,7 +53,7 @@ const mediaUrl = (id) => `/api/media/${id}?t=${encodeURIComponent(TOKEN)}`;
 const thumbUrl = (id) => `/api/thumb/${id}?t=${encodeURIComponent(TOKEN)}`;
 const thumb = (it) => (it.cloud_only ? '<div class="thumb">オンライン専用</div>' : `<div class="thumb"><img loading="lazy" alt="" src="${thumbUrl(it.id)}" data-fallback="1"></div>`);
 
-async function api(path, body) {
+async function api(path, body, opts = {}) {
   const opt = { headers: { 'X-RecSort-Token': TOKEN } };
   if (body !== undefined) {
     opt.method = 'POST';
@@ -64,10 +64,11 @@ async function api(path, body) {
   try {
     res = await fetch(path, opt);
   } catch (e) {
-    setStatus('RecSort のサーバーに接続できません。起動した黒いウィンドウが閉じていないか確認してください');
+    setStatus('RecSort のサーバーに接続できません。終了している場合は RecSortを起動.bat をダブルクリックしてください（自動起動の場合は server.log に原因が記録されます）');
     throw e;
   }
   const data = await res.json().catch(() => ({}));
+  if (opts.quiet && res.status !== 403) return data;  // 呼び出し側が画面に理由を表示する
   if (!res.ok || data.ok === false) {
     const msg = data.error || `エラー（${res.status}）`;
     await alertModal('うまくいきませんでした', `<p>${esc(msg)}</p>`);
@@ -130,7 +131,9 @@ async function render() {
 
 // --- 状態の更新（調査の進み具合） -------------------------------------------------------
 let wasScanning = false;
+let stopped = false;   // 画面から終了した後は、状態を問い合わせない
 async function refreshState() {
+  if (stopped) return;
   try {
     state = await api('/api/state');
   } catch (e) {
@@ -139,12 +142,19 @@ async function refreshState() {
   renderNav();
   const p = state.progress || {};
   if (state.trashing) setStatus('ごみ箱へ移動しています…');
-  else if (state.scanning) setStatus('調査中: ' + (p.text || '録画を探しています'));
+  else if (state.scanning) setStatus('調査中: ' + progressText(p));
   else if (state.scan_result && state.scan_result.cancelled) setStatus('調査を中断しました。途中までの結果を表示しています。「PCをもう一度調べる」で調べ直せます');
   else setStatus(`録画 ${state.videos} 本・${size(state.video_bytes)} · 最終調査: ${date(state.last_scan)}`);
   if (page === 'home') renderScanBox();
-  if (wasScanning && !state.scanning && ['home', 'files', 'plan'].includes(page)) render();  // 調査が終わったら表示を更新
+  if (wasScanning !== state.scanning && page === 'home') render();  // 入力欄の有効・無効を切り替える
+  else if (wasScanning && !state.scanning && ['files', 'plan'].includes(page)) render();  // 調査が終わったら表示を更新
   wasScanning = state.scanning;
+}
+
+function progressText(p) {
+  if (p.text) return p.text;
+  if (p.phase === 'scan') return `${p.location || ''} を調べています… 録画 ${p.found || 0} 本・${size(p.bytes || 0)} 見つかりました`;
+  return '録画を探しています';
 }
 
 // --- ホーム ------------------------------------------------------------------------
@@ -158,15 +168,19 @@ function renderScanBox() {
   const box = $('#scanbox');
   if (!box) return;
   const p = state.progress || {};
+  const target = state.scan_folders && state.scan_folders.length ? '指定したフォルダ' : 'PC 全体';
   if (state.scanning) {
     const pct = p.total ? Math.round((p.done / p.total) * 100) : null;
-    box.innerHTML = `<div class="row"><b>調査中</b><span class="sub">${esc(p.text || '録画を探しています')}</span><span class="spacer"></span><button class="btn small" data-action="cancel-scan">中断</button></div>
+    box.innerHTML = `<div class="row"><b>調査中</b><span class="sub" id="scan-text">${esc(progressText(p))}</span><span class="spacer"></span><button class="btn small" data-action="cancel-scan">中断</button></div>
       <div class="progress ${pct == null ? 'indeterminate' : ''}"><div style="width:${pct ?? 30}%"></div></div>
-      <p class="caption">見つかったものから順に表示します。調査中もほかの画面を見られます。</p>`;
+      <p class="caption">見つかったものから順に表示します。調査中もほかの画面を見られます。ページを再読み込みしても、調査はそのまま続きます。</p>`;
   } else {
     const r = state.scan_result;
-    const msg = r && r.error ? `<span class="sub">調査で問題がありました: ${esc(r.error)}</span>` : `<span class="sub">最終調査: ${date(state.last_scan)}</span>`;
-    box.innerHTML = `<div class="row">${msg}<span class="spacer"></span><button class="btn" data-action="scan">⟳ PCをもう一度調べる</button></div>`;
+    let msg = `<span class="sub">最終調査: ${date(state.last_scan)}</span>`;
+    if (r && r.error) msg = `<span class="sub err">調査できませんでした: ${esc(r.error)}</span>`;
+    else if (r && r.cancelled) msg = '<span class="sub">調査を中断しました。途中までの結果を表示しています。</span>';
+    const skipped = state.skipped_errors ? `<p class="caption">読み取れなかった場所が ${state.skipped_errors} か所あり、スキップしました（権限がない・使用中など）。</p>` : '';
+    box.innerHTML = `<div class="row">${msg}<span class="spacer"></span><button class="btn" data-action="scan">⟳ ${target}をもう一度調べる</button></div>${skipped}`;
   }
 }
 async function home() {
@@ -176,6 +190,7 @@ async function home() {
   main.innerHTML = `
     <div class="page-head"><div><h1>ホーム</h1><p class="sub">何が容量を使っているかを確認し、整理のおすすめから始めましょう。</p></div></div>
     ${banners()}
+    ${folderCard()}
     <div class="card" id="scanbox"></div>
     <div class="card hero" style="margin-top:16px">
       <div class="film" aria-hidden="true">✦</div>
@@ -195,6 +210,54 @@ async function home() {
     </div>
     <p class="caption">ごみ箱へ移しただけでは空き容量は増えません。Windows のごみ箱を空にすると増えます。</p>`;
   renderScanBox();
+  const input = $('#folder-input');
+  if (input) {
+    input.addEventListener('input', (e) => { view.folderInput = e.target.value; });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); scanFolder(); } });
+  }
+}
+function folderCard() {
+  const folders = state.scan_folders || [];
+  const list = folders.length
+    ? `<ul class="plain folders">${folders.map((f) => `<li><span class="path-text">📁 ${esc(f)}</span> <button class="btn small" data-action="remove-folder" data-path="${esc(f)}">外す</button></li>`).join('')}</ul>`
+    : '<p class="caption">フォルダを指定していないときは、PC 全体（ビデオ・デスクトップなどのフォルダ → 内蔵ドライブ）を調べます。</p>';
+  return `<div class="card" id="foldercard" style="margin-bottom:16px">
+    <h2>調べる録画フォルダ</h2>
+    ${list}
+    <div class="row">
+      <input type="text" id="folder-input" placeholder="例: D:\\録画\\ゲーム 録画" value="${esc(view.folderInput || '')}" style="flex:1;min-width:240px" aria-label="調べるフォルダのフルパス" ${state.scanning ? 'disabled' : ''}>
+      <button class="btn" data-action="pick-folder" ${state.scanning ? 'disabled' : ''} title="このパソコンでフォルダを選ぶ画面を開きます">参照…</button>
+      <button class="btn primary" data-action="scan-folder" ${state.scanning ? 'disabled' : ''}>このフォルダを調べる</button>
+    </div>
+    <p class="caption">エクスプローラーのアドレスバーからコピーしたパスを貼り付けられます。録画は読み取るだけで、変更しません。${folders.length ? '「外す」で指定をすべて外すと、PC 全体を調べる設定に戻ります。' : ''}</p>
+    <div id="folder-error" class="note danger" ${view.folderError ? '' : 'hidden'}>${esc(view.folderError || '')}</div>
+  </div>`;
+}
+function showFolderError(msg) {
+  view.folderError = msg || '';
+  const el = $('#folder-error');
+  if (el) { el.textContent = view.folderError; el.hidden = !msg; }
+}
+let scanRequest = false;   // 連打で二重に送らない（サーバー側でも二重の調査は始めない）
+async function scanFolder() {
+  if (scanRequest) return;
+  const value = ($('#folder-input') || {}).value || '';
+  if (!value.trim()) { showFolderError('フォルダのパスを入力するか、「参照…」で選んでください'); return; }
+  const folders = [...(state.scan_folders || [])];
+  scanRequest = true;
+  try {
+    const chk = await api('/api/folder/check', { path: value }, { quiet: true });
+    if (!chk.ok) { showFolderError(chk.error); return; }
+    if (!folders.includes(chk.path)) folders.push(chk.path);
+    const r = await api('/api/scan', { folders }, { quiet: true });
+    if (!r.ok) { showFolderError(r.error || '調査を始められませんでした'); return; }
+    view.folderInput = '';
+    showFolderError('');
+    await refreshState();
+    render();
+  } finally {
+    scanRequest = false;
+  }
 }
 
 // --- ファイル一覧 ----------------------------------------------------------------------
@@ -283,7 +346,7 @@ async function plan() {
   if (view.drive) q.set('drive', view.drive);
   const p = await api('/api/plan?' + q);
   view.plan = p;
-  const checked = view.checked || new Set(p.items.filter((it) => it.kind === 'duplicate' || (it.kind === 'similar' && it.confirmed)).map((it) => it.id));
+  const checked = view.checked || new Set(p.items.filter((it) => it.kind === 'duplicate').map((it) => it.id));  // 似た録画は最初は選ばない（録画ごとに選ぶ）
   view.checked = checked;
   const section = (kind, title, desc) => {
     const list = p.items.filter((it) => it.kind === kind);
@@ -330,25 +393,73 @@ function updateSelSum() {
 }
 
 // --- 比較 --------------------------------------------------------------------------
+const mmss = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+const sceneUrl = (id, i) => `/api/scene/${id}/${i}?t=${encodeURIComponent(TOKEN)}`;
+const SCENE_TEXT = { ref: '基準', match: '一致', differ: '違う', unknown: '比較できない' };
 async function compare() {
   const g = await api('/api/group/' + view.id);
   view.group = g;
+  const similarKind = g.kind === 'similar';
   const kindText = { duplicate: '完全に同じ録画（中身が一致）', similar: '似た録画（同じ内容とは限りません）', single: '録画の確認' }[g.kind];
-  const many = g.kind === 'similar' && g.items.length > 2;
+  const keepHelp = similarKind
+    ? '「これを残す」: この録画を「残す」にします。ほかの録画は変わりません。似た録画を削除候補にするときは、内容を確かめてから録画ごとに「削除候補にする」を押してください。'
+    : g.kind === 'duplicate' ? '「これを残す」: ほかのコピーをすべて削除候補にします（中身が完全に一致したコピーだけ。まだ移動しません）。' : '';
   main.innerHTML = `
     ${steps(1)}
     <div class="page-head"><div><h1>比較して選ぶ</h1><p class="sub">${kindText} · ${g.items.length} 本。再生して内容を確認できます。</p></div>
       <button class="btn" data-go="plan">← おすすめに戻る</button></div>
-    ${view.message ? `<div class="note ok">${esc(view.message)}</div>` : ''}
-    <div class="compare">${g.items.map((it) => `<div class="card ${it.id === g.keep_id ? 'recommended' : ''}">
+    ${view.message ? `<div class="note ok" id="cmp-message">${esc(view.message)}</div>` : ''}
+    ${similarKind ? similarTools(g) : ''}
+    <div class="compare">${g.items.map((it) => `<div class="card ${it.id === g.keep_id ? 'recommended' : ''}" data-member="${it.id}">
       ${it.id === g.keep_id ? `<p class="caption">【残すおすすめ】${esc(g.keep_reason)}</p>` : ''}
+      ${similarKind && it.id === g.reference_id ? '<p class="caption">場面の比較の基準</p>' : ''}
       ${detailHtml(it, { actions: false })}
+      ${similarKind ? `<div class="row" style="margin-top:6px"><button class="btn small" data-action="solo" data-id="${it.id}" title="この録画の音だけを鳴らします">🔈 この音を聞く</button>
+        <span class="caption">音声: ${g.has_audio && g.has_audio[it.id] ? 'あり' : 'なし（または不明）'}</span></div>` : ''}
       <div class="row" style="margin-top:8px">
-        <button class="btn primary small" data-action="keep" data-id="${it.id}" title="${g.kind === 'duplicate' ? 'この1本を残し、ほかのコピーを削除候補にします' : many ? 'この1本を残します（ほかの録画は未確認のまま）' : 'この1本を残し、もう1本を削除候補にします'}">これを残す</button>
-        ${many ? `<button class="btn small" data-action="decide" data-id="${it.id}" data-decision="削除候補" ${it.protected ? 'disabled' : ''}>削除候補にする</button>` : ''}
+        <button class="btn primary small" data-action="keep" data-id="${it.id}" title="${esc(keepHelp)}" ${it.decision === '残す' && similarKind ? 'disabled' : ''}>${it.decision === '残す' && similarKind ? '✓ 残す' : 'これを残す'}</button>
+        ${similarKind ? `<button class="btn small" data-action="mark-candidate" data-id="${it.id}" ${it.protected || it.decision === '削除候補' ? 'disabled' : ''} title="この録画だけを削除候補にします（まだ移動しません）">${it.decision === '削除候補' ? '削除候補にしました' : '削除候補にする'}</button>` : ''}
+        ${similarKind && it.decision ? `<button class="btn small" data-action="decide" data-id="${it.id}" data-decision="">判断を解除</button>` : ''}
       </div></div>`).join('')}</div>
-    <p class="caption" style="margin-top:8px">${g.kind === 'duplicate' ? '「これを残す」: ほかのコピーをすべて削除候補にします（まだ移動しません）。' : many ? '3本以上の似た録画では、「これを残す」で選んだ1本だけを残す判断にします。ほかの録画は、確認してから1本ずつ削除候補にしてください。' : '「これを残す」: もう1本を削除候補にします（まだ移動しません）。'} 保護中の録画は削除候補にしません。</p>
+    <p class="caption" style="margin-top:8px">${keepHelp} 保護中の録画は削除候補にしません。</p>
     <div class="row" style="margin-top:8px"><button class="btn" data-action="keep-all">すべて残す</button><button class="btn" data-action="hold-all">保留（あとで決める）</button></div>`;
+  if (similarKind) drawScenes();
+}
+function similarTools(g) {
+  const differ = g.differ_scenes || [];
+  const times = differ.map((i) => mmss(g.scenes[i].time)).join('、');
+  view.onlyDiffer = view.onlyDiffer ?? differ.length > 0;
+  return `<div class="card" style="margin-bottom:12px" id="similar-tools">
+    <h2>違いのある場面</h2>
+    <p>${differ.length ? `代表場面 ${g.scenes.length} のうち <b>${differ.length} か所</b>で映像が違います（${esc(times)}）。同じ内容とは限りません。` : `代表場面 ${g.scenes.length} か所の映像は一致しました（全編を比べたわけではありません）。`}
+      場面を押すと、すべての録画をその位置に合わせます。</p>
+    <label class="row"><input type="checkbox" id="only-differ" ${view.onlyDiffer ? 'checked' : ''}> 違う場面だけを表示</label>
+    <div id="scenes" class="scenes"></div>
+    <h2 style="margin-top:12px">音声</h2>
+    <p id="audio-result" class="note warn">${esc(g.audio_note)}</p>
+    <div class="row">
+      ${g.items.length === 2 ? `<button class="btn small" data-action="audio-check" data-a="${g.items[0].id}" data-b="${g.items[1].id}">音声を比べる（数区間）</button>` : g.items.filter((x) => x.id !== g.reference_id).map((x) => `<button class="btn small" data-action="audio-check" data-a="${g.reference_id}" data-b="${x.id}">基準と「${esc(x.name)}」の音声を比べる</button>`).join('')}
+      <button class="btn small" data-action="play-all">▶ すべて同時に再生</button>
+      <button class="btn small" data-action="pause-all">⏸ 停止</button>
+    </div>
+    <p class="caption">同時に再生すると、最初は基準の録画の音だけが鳴ります。「この音を聞く」で、聞く録画を切り替えて聞き比べられます。</p>
+  </div>`;
+}
+function drawScenes() {
+  const g = view.group;
+  const box = $('#scenes');
+  if (!box) return;
+  const ids = g.items.map((x) => x.id);
+  const rows = g.scenes.filter((sc) => !view.onlyDiffer || (g.differ_scenes || []).includes(sc.index));
+  box.innerHTML = rows.length ? `<table class="scene-table"><thead><tr><th>位置</th>${g.items.map((x) => `<th>${esc(x.name)}</th>`).join('')}</tr></thead><tbody>
+    ${rows.map((sc) => `<tr data-time="${sc.time}"><td><button class="btn small" data-action="seek" data-time="${sc.time}">${mmss(sc.time)} へ</button></td>
+      ${ids.map((id) => { const st = sc.status[id] || 'unknown'; return `<td class="scene ${st}"><button class="scene-btn" data-action="seek" data-time="${sc.time}" title="${mmss(sc.time)} の場面: ${SCENE_TEXT[st]}"><img loading="lazy" alt="" src="${sceneUrl(id, sc.index)}" data-fallback="1"></button><span class="scene-tag">${SCENE_TEXT[st]}${sc.corr[id] != null ? `（${sc.corr[id]}）` : ''}</span></td>`; }).join('')}</tr>`).join('')}
+    </tbody></table>` : '<p class="caption">表示する場面はありません。</p>';
+}
+function compareVideos() { return [...document.querySelectorAll('.compare video')]; }
+function soloAudio(id) {
+  compareVideos().forEach((v) => { v.muted = Number(v.dataset.id) !== id; });
+  document.querySelectorAll('[data-action="solo"]').forEach((b) => b.classList.toggle('primary', Number(b.dataset.id) === id));
 }
 
 // --- 削除候補・最終確認・結果 ------------------------------------------------------------
@@ -432,6 +543,7 @@ async function result() {
 // --- 設定 --------------------------------------------------------------------------
 async function settings() {
   const s = await api('/api/settings');
+  const auto = await api('/api/autostart', undefined, { quiet: true });
   const list = (key, title, desc) => `<div class="card"><h2>${title}</h2><p class="caption">${desc}</p>
     <ul class="plain">${s[key].map((p) => `<li>${esc(p)} <button class="btn small" data-action="remove-path" data-key="${key}" data-path="${esc(p)}">外す</button></li>`).join('') || '<li class="caption">なし</li>'}</ul>
     <div class="row"><input type="text" id="add-${key}" placeholder="例: D:\\録画" style="flex:1;min-width:200px" aria-label="${title}に追加するフルパス"><button class="btn small" data-action="add-path" data-key="${key}">追加</button></div></div>`;
@@ -448,9 +560,26 @@ async function settings() {
         ${s.not_scanned.length ? `<p class="caption">自動では調べないドライブ（外付け・ネットワーク・リムーバブル）: ${s.not_scanned.map(esc).join('、')}</p>` : ''}</div>
       ${list('extra_locations', '追加で調べる場所', '外付け・ネットワークドライブやフォルダを調べたいときに追加します。次の調査から対象になります。')}
       ${list('excluded_folders', '除外する場所', 'ここに入れたフォルダの中は調べません。')}
+      ${autostartCard(auto)}
       <div class="card"><h2>データの保存場所</h2><p class="caption">${esc(s.data_dir)}（設定・判断・保護・調査結果。データベースは使いません）</p></div>
+      <div class="card"><h2>RecSort を終了する</h2><p class="caption">サーバーを止めます。終了すると、このページは使えなくなります（もう一度使うときは RecSortを起動.bat をダブルクリックします）。</p>
+        <button class="btn" data-action="shutdown">RecSort を終了</button></div>
     </div>`;
   $('#auto_scan').addEventListener('change', (e) => api('/api/settings', { auto_scan: e.target.checked }));
+}
+
+function autostartCard(a) {
+  if (!a || a.ok === false) return `<div class="card"><h2>Windows にログインしたときに起動</h2><p class="note danger">${esc((a && a.error) || '状態を読み取れませんでした')}</p></div>`;
+  if (!a.supported) return `<div class="card"><h2>Windows にログインしたときに起動</h2><p class="caption">${esc(a.message)}</p></div>`;
+  return `<div class="card" id="autostart-card"><h2>Windows にログインしたときに起動</h2>
+    <p>${a.enabled ? '✓ <b>有効</b>: ログインすると、RecSort のサーバーだけが自動で起動します（ブラウザは開きません）。' : '無効: 使うたびに RecSortを起動.bat をダブルクリックします。'}</p>
+    <p class="caption">有効にすると、ログイン後は <b>http://127.0.0.1:${location.port || 8765}/</b> のブックマークやリンクを開くだけで使えます。
+      登録先はこのユーザーだけの「スタートアップ」（レジストリの Run）です。管理者権限は使いません。解除はこの画面からいつでもできます。</p>
+    ${a.message ? `<p class="note warn">${esc(a.message)}</p>` : ''}
+    <div class="row">${a.enabled
+    ? '<button class="btn" data-action="autostart-off">自動起動を解除する</button>' + (a.current ? '' : '<button class="btn" data-action="autostart-on">今の場所で登録し直す</button>')
+    : '<button class="btn primary" data-action="autostart-on">ログイン時に起動するようにする</button>'}</div>
+    ${a.command ? `<p class="caption">登録されている起動コマンド: <code>${esc(a.command)}</code></p>` : ''}</div>`;
 }
 
 // --- 操作 --------------------------------------------------------------------------
@@ -476,7 +605,34 @@ document.addEventListener('click', async (e) => {
   const id = Number(el.dataset.id);
   const a = el.dataset.action;
   try {
-    if (a === 'scan') { await api('/api/scan', {}); await refreshState(); }
+    if (a === 'scan') {
+      if (scanRequest) return;
+      scanRequest = true;
+      try {
+        const r = await api('/api/scan', {}, { quiet: true });
+        if (!r.ok) showFolderError(r.error || '調査を始められませんでした');
+        else showFolderError('');
+        await refreshState();
+      } finally { scanRequest = false; }
+    }
+    else if (a === 'scan-folder') { await scanFolder(); }
+    else if (a === 'pick-folder') {
+      el.disabled = true;
+      setStatus('フォルダを選ぶ画面を開いています…（ブラウザの後ろに隠れている場合はタスクバーを確認してください）');
+      try {
+        const r = await api('/api/folder/pick', {}, { quiet: true });
+        if (!r.ok) showFolderError(r.error);
+        else if (r.path) { view.folderInput = r.path; $('#folder-input').value = r.path; showFolderError(''); }
+      } finally { el.disabled = false; refreshState(); }
+    }
+    else if (a === 'remove-folder') {
+      const next = (state.scan_folders || []).filter((f) => f !== el.dataset.path);
+      const r = await api('/api/folders', { folders: next }, { quiet: true });
+      if (!r.ok) { showFolderError(r.error); return; }
+      showFolderError('');
+      await refreshState();
+      render();
+    }
     else if (a === 'cancel-scan') { await api('/api/scan/cancel', {}); }
     else if (a === 'decide') {
       await decide([id], el.dataset.decision);
@@ -502,12 +658,55 @@ document.addEventListener('click', async (e) => {
       if (go2) go('chosen'); else { view.checked = null; render(); }
     } else if (a === 'keep') {
       const g = view.group;
-      const others = g.kind === 'duplicate' || g.items.length === 2 ? g.items.filter((x) => x.id !== id).map((x) => x.id) : [];
+      const others = g.kind === 'duplicate' ? g.items.filter((x) => x.id !== id).map((x) => x.id) : [];  // 似た録画はほかを変えない
       const r = await api('/api/keep', { keep: id, ids: others });
       const name = g.items.find((x) => x.id === id).name;
-      view.message = others.length ? `「${name}」を残します。ほかの ${r.count} 本を削除候補に追加しました（まだ移動していません）` : `「${name}」を残します。`;
+      view.message = r.count ? `「${name}」を残します。ほかの ${r.count} 本を削除候補に追加しました（まだ移動していません）`
+        : `「${name}」を残します。${g.kind === 'similar' ? 'ほかの録画は変えていません。削除候補にするときは、録画ごとに「削除候補にする」を押してください' : ''}`;
       await refreshState();
       render();
+    } else if (a === 'mark-candidate') {
+      const it = view.group.items.find((x) => x.id === id);
+      const ok = await modal('削除候補にしますか？', `<p>「${esc(it.name)}」を削除候補にします（まだ移動しません。最終確認でごみ箱へ移すかを決めます）。</p>
+        <p class="caption">似た録画は同じ内容とは限りません。違う場面と音声を確かめてから選んでください。</p>`, [['やめる', false], ['削除候補にする', true, 'primary']]);
+      if (!ok) return;
+      await decide([id], '削除候補');
+      view.message = `「${it.name}」を削除候補に追加しました（まだ移動していません）`;
+      render();
+    } else if (a === 'seek') {
+      const t = Number(el.dataset.time);
+      compareVideos().forEach((v) => { try { v.currentTime = t; } catch (e) { /* 読み込み前 */ } });
+    } else if (a === 'play-all') {
+      const vids = compareVideos();
+      if (vids.filter((v) => !v.muted).length !== 1 && view.group) soloAudio(view.group.reference_id);  // 音は1本だけ鳴らす
+      await Promise.all(vids.map((v) => v.play().catch(() => {})));
+    } else if (a === 'pause-all') { compareVideos().forEach((v) => v.pause()); }
+    else if (a === 'solo') { soloAudio(id); }
+    else if (a === 'audio-check') {
+      el.disabled = true;
+      const box = $('#audio-result');
+      box.textContent = '音声を比べています…（数秒かかります）';
+      const r = await api(`/api/audio/${el.dataset.a}/${el.dataset.b}`);
+      const cls = { same: 'ok', different: 'danger' }[r.verdict] || 'warn';
+      const head = { same: '音声: 確認した区間は一致しました', different: '音声: 違う区間があります', no_audio: '音声の一致を確認できません', silent: '音声の一致を確認できません', unknown: '音声の一致を確認できません' }[r.verdict];
+      box.className = `note ${cls}`;
+      box.innerHTML = `<b>${esc(head)}</b><br>${esc(r.reason)}${r.verdict === 'same' ? '' : '<br>両方を再生して、「この音を聞く」で切り替えながら聞き比べてください。'}`;
+      el.disabled = false;
+    } else if (a === 'autostart-on' || a === 'autostart-off') {
+      const on = a === 'autostart-on';
+      const ok = await modal(on ? 'ログイン時に起動しますか？' : '自動起動を解除しますか？', on
+        ? '<p>次回から、Windows にログインすると RecSort のサーバーだけが起動します（ブラウザは開きません）。</p><p class="caption">ブックマークやリンクから http://127.0.0.1:8765/ を開くと使えます。解除はこの画面から行えます。</p>'
+        : '<p>次回のログインからは自動で起動しません。今動いている RecSort はそのまま使えます。</p>', [['やめる', false], [on ? '有効にする' : '解除する', true, 'primary']]);
+      if (!ok) return;
+      await api('/api/autostart', { enabled: on });
+      render();
+    } else if (a === 'shutdown') {
+      const ok = await modal('RecSort を終了しますか？', '<p>サーバーを止めます。調査中の場合は中断します（途中までの結果は残ります）。</p>', [['やめる', false], ['終了する', true, 'danger']]);
+      if (!ok) return;
+      await api('/api/shutdown', { confirm: true });
+      stopped = true;
+      main.innerHTML = '<div class="card"><h1>RecSort を終了しました</h1><p>このタブは閉じてかまいません。もう一度使うときは、RecSortを起動.bat をダブルクリックしてください（ログイン時の自動起動を有効にしている場合は、次のログインで起動します）。</p></div>';
+      setStatus('RecSort を終了しました');
     } else if (a === 'keep-all' || a === 'hold-all') {
       await decide(view.group.items.map((x) => x.id), a === 'keep-all' ? '残す' : '保留');
       view.message = a === 'keep-all' ? `このグループの ${view.group.items.length} 本をすべて残します` : 'このグループは「保留」にしました（候補からいったん外れます）';
@@ -526,6 +725,7 @@ document.addEventListener('click', async (e) => {
   }
 });
 document.addEventListener('change', (e) => {
+  if (e.target.id === 'only-differ') { view.onlyDiffer = e.target.checked; drawScenes(); return; }
   const c = e.target.closest('[data-check]');
   if (c && view.checked) {
     const id = Number(c.dataset.check);
@@ -540,7 +740,7 @@ document.addEventListener('keydown', (e) => {
 // サムネイルを作れなかったとき（FFmpeg がない・読めない）は、文字で示す
 document.addEventListener('error', (e) => {
   const img = e.target;
-  if (img.tagName === 'IMG' && img.dataset.fallback) img.parentElement.textContent = 'プレビューなし';
+  if (img.tagName === 'IMG' && img.dataset.fallback) img.parentElement.textContent = state && !state.ffmpeg ? 'プレビューなし（FFmpeg なし）' : 'プレビューなし';
   if (img.tagName === 'VIDEO') {
     const box = img.parentElement;
     box.innerHTML = `<div class="caption" style="padding:12px;text-align:center">この形式はブラウザで再生できません。<br><button class="btn small" data-action="reveal" data-id="${img.dataset.id}">保存場所を開く</button></div>`;
