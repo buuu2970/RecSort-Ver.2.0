@@ -53,7 +53,7 @@ const mediaUrl = (id) => `/api/media/${id}?t=${encodeURIComponent(TOKEN)}`;
 const thumbUrl = (id) => `/api/thumb/${id}?t=${encodeURIComponent(TOKEN)}`;
 const thumb = (it) => (it.cloud_only ? '<div class="thumb">オンライン専用</div>' : `<div class="thumb"><img loading="lazy" alt="" src="${thumbUrl(it.id)}" data-fallback="1"></div>`);
 
-async function api(path, body) {
+async function api(path, body, opts = {}) {
   const opt = { headers: { 'X-RecSort-Token': TOKEN } };
   if (body !== undefined) {
     opt.method = 'POST';
@@ -68,6 +68,7 @@ async function api(path, body) {
     throw e;
   }
   const data = await res.json().catch(() => ({}));
+  if (opts.quiet && res.status !== 403) return data;  // 呼び出し側が画面に理由を表示する
   if (!res.ok || data.ok === false) {
     const msg = data.error || `エラー（${res.status}）`;
     await alertModal('うまくいきませんでした', `<p>${esc(msg)}</p>`);
@@ -139,12 +140,19 @@ async function refreshState() {
   renderNav();
   const p = state.progress || {};
   if (state.trashing) setStatus('ごみ箱へ移動しています…');
-  else if (state.scanning) setStatus('調査中: ' + (p.text || '録画を探しています'));
+  else if (state.scanning) setStatus('調査中: ' + progressText(p));
   else if (state.scan_result && state.scan_result.cancelled) setStatus('調査を中断しました。途中までの結果を表示しています。「PCをもう一度調べる」で調べ直せます');
   else setStatus(`録画 ${state.videos} 本・${size(state.video_bytes)} · 最終調査: ${date(state.last_scan)}`);
   if (page === 'home') renderScanBox();
-  if (wasScanning && !state.scanning && ['home', 'files', 'plan'].includes(page)) render();  // 調査が終わったら表示を更新
+  if (wasScanning !== state.scanning && page === 'home') render();  // 入力欄の有効・無効を切り替える
+  else if (wasScanning && !state.scanning && ['files', 'plan'].includes(page)) render();  // 調査が終わったら表示を更新
   wasScanning = state.scanning;
+}
+
+function progressText(p) {
+  if (p.text) return p.text;
+  if (p.phase === 'scan') return `${p.location || ''} を調べています… 録画 ${p.found || 0} 本・${size(p.bytes || 0)} 見つかりました`;
+  return '録画を探しています';
 }
 
 // --- ホーム ------------------------------------------------------------------------
@@ -158,15 +166,19 @@ function renderScanBox() {
   const box = $('#scanbox');
   if (!box) return;
   const p = state.progress || {};
+  const target = state.scan_folders && state.scan_folders.length ? '指定したフォルダ' : 'PC 全体';
   if (state.scanning) {
     const pct = p.total ? Math.round((p.done / p.total) * 100) : null;
-    box.innerHTML = `<div class="row"><b>調査中</b><span class="sub">${esc(p.text || '録画を探しています')}</span><span class="spacer"></span><button class="btn small" data-action="cancel-scan">中断</button></div>
+    box.innerHTML = `<div class="row"><b>調査中</b><span class="sub" id="scan-text">${esc(progressText(p))}</span><span class="spacer"></span><button class="btn small" data-action="cancel-scan">中断</button></div>
       <div class="progress ${pct == null ? 'indeterminate' : ''}"><div style="width:${pct ?? 30}%"></div></div>
-      <p class="caption">見つかったものから順に表示します。調査中もほかの画面を見られます。</p>`;
+      <p class="caption">見つかったものから順に表示します。調査中もほかの画面を見られます。ページを再読み込みしても、調査はそのまま続きます。</p>`;
   } else {
     const r = state.scan_result;
-    const msg = r && r.error ? `<span class="sub">調査で問題がありました: ${esc(r.error)}</span>` : `<span class="sub">最終調査: ${date(state.last_scan)}</span>`;
-    box.innerHTML = `<div class="row">${msg}<span class="spacer"></span><button class="btn" data-action="scan">⟳ PCをもう一度調べる</button></div>`;
+    let msg = `<span class="sub">最終調査: ${date(state.last_scan)}</span>`;
+    if (r && r.error) msg = `<span class="sub err">調査できませんでした: ${esc(r.error)}</span>`;
+    else if (r && r.cancelled) msg = '<span class="sub">調査を中断しました。途中までの結果を表示しています。</span>';
+    const skipped = state.skipped_errors ? `<p class="caption">読み取れなかった場所が ${state.skipped_errors} か所あり、スキップしました（権限がない・使用中など）。</p>` : '';
+    box.innerHTML = `<div class="row">${msg}<span class="spacer"></span><button class="btn" data-action="scan">⟳ ${target}をもう一度調べる</button></div>${skipped}`;
   }
 }
 async function home() {
@@ -176,6 +188,7 @@ async function home() {
   main.innerHTML = `
     <div class="page-head"><div><h1>ホーム</h1><p class="sub">何が容量を使っているかを確認し、整理のおすすめから始めましょう。</p></div></div>
     ${banners()}
+    ${folderCard()}
     <div class="card" id="scanbox"></div>
     <div class="card hero" style="margin-top:16px">
       <div class="film" aria-hidden="true">✦</div>
@@ -195,6 +208,54 @@ async function home() {
     </div>
     <p class="caption">ごみ箱へ移しただけでは空き容量は増えません。Windows のごみ箱を空にすると増えます。</p>`;
   renderScanBox();
+  const input = $('#folder-input');
+  if (input) {
+    input.addEventListener('input', (e) => { view.folderInput = e.target.value; });
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); scanFolder(); } });
+  }
+}
+function folderCard() {
+  const folders = state.scan_folders || [];
+  const list = folders.length
+    ? `<ul class="plain folders">${folders.map((f) => `<li><span class="path-text">📁 ${esc(f)}</span> <button class="btn small" data-action="remove-folder" data-path="${esc(f)}">外す</button></li>`).join('')}</ul>`
+    : '<p class="caption">フォルダを指定していないときは、PC 全体（ビデオ・デスクトップなどのフォルダ → 内蔵ドライブ）を調べます。</p>';
+  return `<div class="card" id="foldercard" style="margin-bottom:16px">
+    <h2>調べる録画フォルダ</h2>
+    ${list}
+    <div class="row">
+      <input type="text" id="folder-input" placeholder="例: D:\\録画\\ゲーム 録画" value="${esc(view.folderInput || '')}" style="flex:1;min-width:240px" aria-label="調べるフォルダのフルパス" ${state.scanning ? 'disabled' : ''}>
+      <button class="btn" data-action="pick-folder" ${state.scanning ? 'disabled' : ''} title="このパソコンでフォルダを選ぶ画面を開きます">参照…</button>
+      <button class="btn primary" data-action="scan-folder" ${state.scanning ? 'disabled' : ''}>このフォルダを調べる</button>
+    </div>
+    <p class="caption">エクスプローラーのアドレスバーからコピーしたパスを貼り付けられます。録画は読み取るだけで、変更しません。${folders.length ? '「外す」で指定をすべて外すと、PC 全体を調べる設定に戻ります。' : ''}</p>
+    <div id="folder-error" class="note danger" ${view.folderError ? '' : 'hidden'}>${esc(view.folderError || '')}</div>
+  </div>`;
+}
+function showFolderError(msg) {
+  view.folderError = msg || '';
+  const el = $('#folder-error');
+  if (el) { el.textContent = view.folderError; el.hidden = !msg; }
+}
+let scanRequest = false;   // 連打で二重に送らない（サーバー側でも二重の調査は始めない）
+async function scanFolder() {
+  if (scanRequest) return;
+  const value = ($('#folder-input') || {}).value || '';
+  if (!value.trim()) { showFolderError('フォルダのパスを入力するか、「参照…」で選んでください'); return; }
+  const folders = [...(state.scan_folders || [])];
+  scanRequest = true;
+  try {
+    const chk = await api('/api/folder/check', { path: value }, { quiet: true });
+    if (!chk.ok) { showFolderError(chk.error); return; }
+    if (!folders.includes(chk.path)) folders.push(chk.path);
+    const r = await api('/api/scan', { folders }, { quiet: true });
+    if (!r.ok) { showFolderError(r.error || '調査を始められませんでした'); return; }
+    view.folderInput = '';
+    showFolderError('');
+    await refreshState();
+    render();
+  } finally {
+    scanRequest = false;
+  }
 }
 
 // --- ファイル一覧 ----------------------------------------------------------------------
@@ -476,7 +537,34 @@ document.addEventListener('click', async (e) => {
   const id = Number(el.dataset.id);
   const a = el.dataset.action;
   try {
-    if (a === 'scan') { await api('/api/scan', {}); await refreshState(); }
+    if (a === 'scan') {
+      if (scanRequest) return;
+      scanRequest = true;
+      try {
+        const r = await api('/api/scan', {}, { quiet: true });
+        if (!r.ok) showFolderError(r.error || '調査を始められませんでした');
+        else showFolderError('');
+        await refreshState();
+      } finally { scanRequest = false; }
+    }
+    else if (a === 'scan-folder') { await scanFolder(); }
+    else if (a === 'pick-folder') {
+      el.disabled = true;
+      setStatus('フォルダを選ぶ画面を開いています…（ブラウザの後ろに隠れている場合はタスクバーを確認してください）');
+      try {
+        const r = await api('/api/folder/pick', {}, { quiet: true });
+        if (!r.ok) showFolderError(r.error);
+        else if (r.path) { view.folderInput = r.path; $('#folder-input').value = r.path; showFolderError(''); }
+      } finally { el.disabled = false; refreshState(); }
+    }
+    else if (a === 'remove-folder') {
+      const next = (state.scan_folders || []).filter((f) => f !== el.dataset.path);
+      const r = await api('/api/folders', { folders: next }, { quiet: true });
+      if (!r.ok) { showFolderError(r.error); return; }
+      showFolderError('');
+      await refreshState();
+      render();
+    }
     else if (a === 'cancel-scan') { await api('/api/scan/cancel', {}); }
     else if (a === 'decide') {
       await decide([id], el.dataset.decision);
@@ -540,7 +628,7 @@ document.addEventListener('keydown', (e) => {
 // サムネイルを作れなかったとき（FFmpeg がない・読めない）は、文字で示す
 document.addEventListener('error', (e) => {
   const img = e.target;
-  if (img.tagName === 'IMG' && img.dataset.fallback) img.parentElement.textContent = 'プレビューなし';
+  if (img.tagName === 'IMG' && img.dataset.fallback) img.parentElement.textContent = state && !state.ffmpeg ? 'プレビューなし（FFmpeg なし）' : 'プレビューなし';
   if (img.tagName === 'VIDEO') {
     const box = img.parentElement;
     box.innerHTML = `<div class="caption" style="padding:12px;text-align:center">この形式はブラウザで再生できません。<br><button class="btn small" data-action="reveal" data-id="${img.dataset.id}">保存場所を開く</button></div>`;

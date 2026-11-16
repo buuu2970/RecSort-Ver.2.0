@@ -121,3 +121,8 @@ ul.plain { margin: 4px 0; padding-left: 20px; }
   .item { grid-template-columns: auto minmax(0, 1fr); }
   .item .thumb { display: none; }
 }
+/* 調べる録画フォルダ */
+.folders li { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+.path-text { word-break: break-all; }
+.sub.err { color: var(--danger-hover); }
+[hidden] { display: none !important; }

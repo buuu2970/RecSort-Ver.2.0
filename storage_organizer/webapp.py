@@ -27,6 +27,54 @@ from .store import Store, StoreError
 
 UI_DIR = Path(__file__).resolve().parent / "web_ui"
 DECISIONS = {"残す", "保留", "削除候補", None}
+DEFAULT_PORT = 8765
+HEALTH_PATH = "/api/health"
+# Windows ではレジストリの設定で .js が text/plain になることがある（nosniff で読み込まれなくなる）ため、固定で決める
+STATIC_TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+                ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png",
+                ".ico": "image/x-icon"}
+VIDEO_TYPES = {".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+               ".mkv": "video/x-matroska", ".ts": "video/mp2t", ".m2ts": "video/mp2t", ".mts": "video/mp2t",
+               ".avi": "video/x-msvideo", ".wmv": "video/x-ms-wmv", ".flv": "video/x-flv", ".mpg": "video/mpeg",
+               ".mpeg": "video/mpeg", ".3gp": "video/3gpp", ".ogv": "video/ogg"}
+
+
+def check_folder(raw) -> tuple[str | None, str | None]:
+    """画面で入力されたフォルダを確かめる。(正規化したパス, 問題があればその理由)。
+
+    中身は読み取るだけで、変更しない。エクスプローラーの「パスのコピー」で付く前後の " は外す。
+    """
+    text = str(raw or "").strip().strip('"').strip()
+    if not text:
+        return None, "フォルダのパスを入力してください"
+    if not os.path.isabs(text) or (os.name == "nt" and not os.path.splitdrive(text)[0]):
+        return None, f"フルパスで指定してください（例: D:\\録画）: {text}"
+    path = os.path.normpath(text)
+    if not os.path.exists(path):
+        return None, f"フォルダが見つかりません: {path}"
+    if not os.path.isdir(path):
+        return None, f"フォルダではありません（ファイルが指定されています）: {path}"
+    try:
+        with os.scandir(path) as it:
+            next(it, None)
+    except PermissionError:
+        return None, f"フォルダを読み取る権限がありません: {path}"
+    except OSError as e:
+        return None, f"フォルダを読み取れません（{e.strerror or type(e).__name__}）: {path}"
+    return path, None
+
+
+# フォルダを選ぶ Windows の画面（tkinter）を別プロセスで開く。結果は JSON（ASCII）で受け取る
+_PICKER = r"""
+import json, tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+path = filedialog.askdirectory(parent=root, title="録画のフォルダを選択", mustexist=True)
+root.destroy()
+print(json.dumps(path or ""))
+"""
 
 
 class App:
@@ -43,6 +91,7 @@ class App:
         self.trash_job: dict | None = None
         self._lock = threading.Lock()
         self._thumb_lock = threading.Semaphore(2)
+        self._picker_lock = threading.Lock()
 
     # --- 共通 -----------------------------------------------------------------
     def tools(self) -> media.FFmpegTools:
@@ -88,13 +137,43 @@ class App:
             "trashing": bool(self.trash_job and not self.trash_job.get("done")),
             "not_scanned": self.db.json_list("not_scanned_drives"),
             "data_dir": str(self.db.data_dir),
+            "scan_folders": self.db.json_list("scan_folders"),
+            "skipped_errors": self.db.skip_count("error"),
+            "locations": [{"path": x["path"], "label": x.get("label"), "status": x.get("status"),
+                           "files": x.get("files", 0)} for x in self.db.locations()],
         }
 
     # --- 調査 -----------------------------------------------------------------
+    def set_scan_folders(self, folders: list) -> dict:
+        """調べるフォルダを保存する（空なら PC 全体を調べる既定の動きに戻す）。存在しない・読めないものは保存しない。"""
+        checked = []
+        for raw in folders:
+            path, err = check_folder(raw)
+            if err:
+                return {"ok": False, "error": err}
+            checked.append(path)
+        if self.scan_thread is not None and self.scan_thread.is_alive():
+            return {"ok": False, "error": "調査中は調べるフォルダを変更できません。中断してからもう一度操作してください"}
+        self.db.set_json_list("scan_folders", checked)
+        return {"ok": True, "scan_folders": self.db.json_list("scan_folders")}
+
+    def scan_problem(self) -> str | None:
+        """調べるフォルダが今も使えるか（外付けドライブを外した・名前を変えた、など）。"""
+        for path in self.db.json_list("scan_folders"):
+            _, err = check_folder(path)
+            if err:
+                return err + "（調べるフォルダを指定し直してください）"
+        return None
+
     def start_scan(self) -> dict:
         with self._lock:
             if self.scan_thread is not None and self.scan_thread.is_alive():
-                return {"ok": False, "error": "調査中です"}
+                # 再読み込み・連打で同じ調査を二重に始めない（今の調査の進み具合をそのまま表示する）
+                return {"ok": True, "already_running": True}
+            problem = self.scan_problem()
+            if problem:  # 調べられない場所を「調べた結果 0 本」として扱わない
+                self.scan_result = {"error": problem}
+                return {"ok": False, "error": problem}
             self.scan_ctl = ctl = autoscan.Controller()
             self.scan_progress = {"text": "調査を始めています"}
             self.scan_result = None
@@ -223,9 +302,28 @@ class App:
         return {"running": not job["done"], **{k: v for k, v in job.items() if k != "cancel"}}
 
     # --- 設定 -----------------------------------------------------------------
+    def pick_folder(self) -> dict:
+        """このパソコンでフォルダを選ぶ画面を開く（ブラウザはフォルダのフルパスを教えてくれないため）。"""
+        if not self._picker_lock.acquire(blocking=False):
+            return {"ok": False, "error": "フォルダを選ぶ画面がすでに開いています（タスクバーを確認してください）"}
+        try:
+            kw = {"creationflags": 0x08000000} if os.name == "nt" else {}  # 黒い窓を出さない
+            done = subprocess.run([sys.executable, "-c", _PICKER], capture_output=True, text=True,
+                                  timeout=900, **kw)
+            if done.returncode != 0:
+                raise RuntimeError(done.stderr.strip().splitlines()[-1] if done.stderr.strip() else "起動できません")
+            path = json.loads(done.stdout.strip().splitlines()[-1])
+        except Exception as e:  # noqa: BLE001  tkinter がない Python など。パスの入力で続けられる
+            return {"ok": False, "error": "フォルダを選ぶ画面を開けませんでした。パスを直接入力してください"
+                                          f"（{e}）"}
+        finally:
+            self._picker_lock.release()
+        return {"ok": True, "path": os.path.normpath(path) if path else ""}
+
     def settings(self) -> dict:
         tools = self.tools()
         return {"ffmpeg_dir": self.db.get_setting("ffmpeg_dir") or "", "ffmpeg": tools.available,
+                "scan_folders": self.db.json_list("scan_folders"),
                 "ffmpeg_source": tools.source, "auto_scan": self.db.get_setting("auto_scan_on_start", "1") != "0",
                 "locations": self.db.locations(), "extra_locations": self.db.json_list("extra_locations"),
                 "excluded_folders": self.db.json_list("excluded_folders"),
@@ -344,6 +442,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         path = url.path
+        if path == HEALTH_PATH:  # 起動確認用（合言葉なし）。録画の情報は返さない
+            return self._json({"app": APP_NAME, "service": "recsort", "version": __version__})
         if not path.startswith("/api/"):
             return self._static(path)
         if not self._token_ok(q):
@@ -389,7 +489,22 @@ class Handler(BaseHTTPRequestHandler):
             ids = [int(i) for i in data.get("ids", [])]
             p = url.path
             if p == "/api/scan":
+                if "folders" in data:  # 調べるフォルダを指定して調べる（空のリストは PC 全体）
+                    if not isinstance(data["folders"], list):
+                        raise ValueError("folders")
+                    saved = self.app.set_scan_folders(data["folders"])
+                    if not saved["ok"]:
+                        return self._json(saved)
                 return self._json(self.app.start_scan())
+            if p == "/api/folders":
+                if not isinstance(data.get("folders"), list):
+                    raise ValueError("folders")
+                return self._json(self.app.set_scan_folders(data["folders"]))
+            if p == "/api/folder/check":
+                path, err = check_folder(data.get("path"))
+                return self._json({"ok": err is None, "path": path, "error": err})
+            if p == "/api/folder/pick":
+                return self._json(self.app.pick_folder())
             if p == "/api/scan/cancel":
                 return self._json(self.app.cancel_scan())
             if p == "/api/decide":
@@ -434,9 +549,7 @@ class Handler(BaseHTTPRequestHandler):
         body = target.read_bytes()
         if name == "index.html":  # 合言葉は、このパソコンで開いたページにだけ渡す
             body = body.replace(b"__RECSORT_TOKEN__", self.app.token.encode())
-        ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        if ctype.startswith("text/") or ctype.endswith("javascript"):
-            ctype += "; charset=utf-8"
+        ctype = STATIC_TYPES.get(target.suffix.lower()) or mimetypes.guess_type(name)[0] or "application/octet-stream"
         self._send(200, body, ctype, {"Content-Security-Policy": "default-src 'self'; style-src 'self' 'unsafe-inline'; media-src 'self'; img-src 'self' data:"})
 
     def _file(self, path: str | None, ctype: str | None = None) -> None:
@@ -444,7 +557,8 @@ class Handler(BaseHTTPRequestHandler):
         if not path or not os.path.isfile(path):
             return self._error(HTTPStatus.NOT_FOUND, "見つかりません")
         size = os.path.getsize(path)
-        ctype = ctype or mimetypes.guess_type(path)[0] or "application/octet-stream"
+        ctype = (ctype or VIDEO_TYPES.get(os.path.splitext(path)[1].lower()) or mimetypes.guess_type(path)[0]
+                 or "application/octet-stream")
         start, end, status = 0, size - 1, 200
         rng = self.headers.get("Range")
         if rng and rng.startswith("bytes="):
@@ -487,40 +601,162 @@ class Handler(BaseHTTPRequestHandler):
             pass  # 再生位置を変えるとブラウザが途中で接続を切る（正常）
 
 
+class LocalServer(ThreadingHTTPServer):
+    """127.0.0.1 だけで待ち受けるサーバー。
+
+    Windows の SO_REUSEADDR は「ほかのアプリが使っている番号にも割り込める」意味になるため使わず、
+    SO_EXCLUSIVEADDRUSE で、使われている番号では確実に起動に失敗するようにする（別のアプリと取り合わない）。
+    """
+
+    allow_reuse_address = os.name != "nt"
+    daemon_threads = True
+
+    def server_bind(self):
+        import socket
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def make_server(app: App, port: int = 0) -> ThreadingHTTPServer:
     handler = type("BoundHandler", (Handler,), {"app": app})
-    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    server.daemon_threads = True
-    return server
+    return LocalServer(("127.0.0.1", port), handler)
+
+
+def probe(port: int, timeout: float = 2.0) -> str:
+    """その番号で何が動いているか。"recsort" / "other"（別のアプリ）/ "none"（何も待ち受けていない）。"""
+    import http.client
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.request("GET", HEALTH_PATH, headers={"Host": f"127.0.0.1:{port}"})
+        res = conn.getresponse()
+        body = res.read(4096)
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except ValueError:
+            return "other"
+        return "recsort" if res.status == 200 and isinstance(data, dict) and data.get("service") == "recsort" \
+            else "other"
+    except ConnectionRefusedError:
+        return "none"
+    except OSError:  # 接続できたが HTTP で答えない・時間切れ など
+        return "other"
+    finally:
+        conn.close()
+
+
+def wait_ready(port: int, timeout: float = 30.0) -> bool:
+    """サーバーが応答できる状態になるまで待つ。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if probe(port, 1.0) == "recsort":
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def _port_from(argv: list[str]) -> int:
+    for i, a in enumerate(argv):
+        if a == "--port" and i + 1 < len(argv):
+            return int(argv[i + 1])
+        if a.startswith("--port="):
+            return int(a.split("=", 1)[1])
+    return int(os.environ.get("RECSORT_PORT") or DEFAULT_PORT)
+
+
+def _open_browser(url: str) -> None:
+    try:
+        if not webbrowser.open(url):
+            print(f"ブラウザを開けませんでした。次のアドレスをブラウザで開いてください: {url}")
+    except Exception:  # noqa: BLE001
+        print(f"ブラウザを開けませんでした。次のアドレスをブラウザで開いてください: {url}")
+
+
+def _stop_on_signals() -> None:
+    """ウィンドウを閉じた（Windows: SIGBREAK）・終了の要求（SIGTERM）でも、Ctrl+C と同じく記録を保存して終わる。"""
+    import signal
+
+    def stop(*_):
+        raise KeyboardInterrupt
+    for name in ("SIGTERM", "SIGBREAK"):
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), stop)
+            except (OSError, ValueError):
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:
     from .instance_lock import AlreadyRunning, InstanceLock
     from .store import default_data_dir
     argv = sys.argv[1:] if argv is None else argv
+    open_browser = "--no-browser" not in argv
+    try:
+        port = _port_from(argv)
+    except ValueError:
+        print("--port には番号（例: 8765）を指定してください。")
+        return 2
+    url = f"http://127.0.0.1:{port}/"
+
+    # 1. すでに RecSort が動いていれば、その画面を開くだけにする（2つ目は起動しない）
+    found = probe(port)
+    if found == "recsort":
+        print(f"RecSort はすでに起動しています。開いている画面を表示します: {url}")
+        if open_browser:
+            _open_browser(url)
+        return 0
+    if found == "other":
+        print(f"ポート {port} は別のアプリが使用しているため、RecSort を起動できません。")
+        print("そのアプリを終了するか、別の番号で起動してください（例: RecSortを起動.bat --port 8766）。")
+        return 3
+
     data_dir = default_data_dir()
     try:  # 保存データを読み書きする前に、二重起動を防ぐロックを取る（デスクトップ版とも共通）
         lock = InstanceLock(data_dir).acquire()
     except AlreadyRunning:
-        print("RecSort はすでに起動しています。保護や判断の記録が食い違わないよう、同時に2つは起動できません。")
+        if wait_ready(port, 10):  # ほぼ同時にダブルクリックした場合: 先に起動した方の画面を開く
+            print(f"RecSort はすでに起動しています。開いている画面を表示します: {url}")
+            if open_browser:
+                _open_browser(url)
+            return 0
+        print("RecSort はすでに起動しています（デスクトップ版、または別の番号のブラウザ版）。")
+        print("保護や判断の記録が食い違わないよう、同時に2つは起動できません。起動中の RecSort を使ってください。")
         return 1
     try:
-        db = Store(data_dir)
+        try:
+            db = Store(data_dir)
+        except Exception as e:  # noqa: BLE001
+            print(f"保存データを読み込めませんでした（{data_dir}）: {e}")
+            return 1
         app = App(db)
-        server = None
-        for port in (8765, 8766, 8767, 0):  # 決まった番号が使われていれば、空いている番号を使う
-            try:
-                server = make_server(app, port)
-                break
-            except OSError:
-                continue
-        url = f"http://127.0.0.1:{server.server_address[1]}/"
-        print(f"RecSort {__version__} をブラウザで開きます: {url}")
-        print("このウィンドウを閉じるか Ctrl+C で終了します。")
-        if "--no-browser" not in argv:
-            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        try:
+            server = make_server(app, port)
+        except OSError as e:
+            print(f"ポート {port} を使えないため、RecSort を起動できません（{e.strerror or e}）。")
+            print("別のアプリが使用している可能性があります。そのアプリを終了するか、--port で別の番号を指定してください。")
+            return 3
+        port = server.server_address[1]
+        url = f"http://127.0.0.1:{port}/"
+        print(f"RecSort {__version__} を起動しました: {url}")
+        print(f"保存データ: {data_dir}")
+        print("このアドレスをブラウザで開いても使えます。このウィンドウを閉じるか Ctrl+C で終了します。")
+
+        def open_when_ready():  # 応答できる状態になってからブラウザを開く
+            if wait_ready(port):
+                if open_browser:
+                    _open_browser(url)
+            else:
+                print("サーバーの応答を確認できませんでした。しばらくしてから上のアドレスを開いてください。")
+        threading.Thread(target=open_when_ready, name="recsort-open", daemon=True).start()
+        tools = app.tools()
+        if not tools.available:
+            print("FFmpeg が見つかりません（長さ・黒画面・無音・類似の判定とサムネイルが使えません）。"
+                  "例: winget install Gyan.FFmpeg")
         if db.get_setting("auto_scan_on_start", "1") != "0" and "--no-scan" not in argv:
-            app.start_scan()
+            started = app.start_scan()
+            if not started.get("ok"):
+                print("自動調査を始めませんでした: " + str(started.get("error")))
+        _stop_on_signals()
         try:
             server.serve_forever(poll_interval=0.5)
         except KeyboardInterrupt:

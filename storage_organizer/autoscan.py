@@ -269,6 +269,11 @@ def build_locations(db: Store, include_disabled: bool = False) -> tuple[list[Loc
             seen.add(norm(path))
             locations.append(Location(path, kind, label, len(locations)))
 
+    folders = db.json_list("scan_folders")
+    if folders:  # 画面で調べるフォルダを指定したときは、そのフォルダだけを調べる（PC 全体は調べない）
+        for path in folders:
+            add(path, "folder", f"指定したフォルダ {os.path.normpath(path)}")
+        return locations, []
     for label, path in known_folders():
         add(path, "known", label)
     not_scanned = []
