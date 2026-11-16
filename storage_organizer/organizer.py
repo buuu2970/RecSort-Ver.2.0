@@ -2731,7 +2731,7 @@ class ComparePage(QWidget):
         v.addWidget(label(" ".join(badges) or "　", None))
         # 操作は上に置く（場面を見るためにスクロールしても、まず操作が見える）
         row = QHBoxLayout()
-        keep = button("これを残す", "primary", "check", "この1本を残し、ほかを削除候補にします（まだ移動しません）")
+        keep = button("これを残す", "primary", "check", self._keep_scope_text(r["id"]))
         scope = self._keep_scope_text(r["id"])
         play = button("再生", None, "play")
         keep.clicked.connect(partial(self._keep_this, r["id"]))
@@ -2824,20 +2824,19 @@ class ComparePage(QWidget):
             self.state.refresh()
 
     def _targets_for_keep(self, mid: int) -> list[int]:
-        """「これを残す」で削除候補にする録画。完全に同じファイルはほかのコピー全部、
-        似た録画は比較中のもう1本だけ（確認していない録画は入れない）。保護中は入れない。"""
+        """「これを残す」で削除候補にする録画。完全に同じファイルはほかのコピー全部。
+        似た録画は同じ内容とは限らないので、ほかの録画は変えない（削除候補にするときは録画ごとに選ぶ）。保護中は入れない。"""
         kind = self.group[0] if self.group else "duplicate"
-        others = [m for m in self.members() if m != mid] if kind == "duplicate" else \
-            [m for m in self.pair if m != mid]
+        if kind != "duplicate":
+            return []
+        others = [m for m in self.members() if m != mid]
         return [m for m in others if not self.state.db.video(m)["protected"]]
 
     def _keep_scope_text(self, mid: int) -> str:
         n = len(self._targets_for_keep(mid))
         if self.group and self.group[0] == "duplicate":
             return f"ほかのコピー {n} 本を削除候補にします（まだ移動しません）"
-        if len(self.members()) > 2:
-            return "比較中のもう1本だけを削除候補にします（ほかの録画は未確認のまま）"
-        return "もう1本を削除候補にします（まだ移動しません）"
+        return "この録画を「残す」にします。ほかの録画は変わりません（削除候補にするときは、録画ごとに選んでください）"
 
     def _remember(self, ids) -> None:
         self._undo = {m: self.state.db.video(m)["decision"] for m in ids}
@@ -2859,7 +2858,8 @@ class ComparePage(QWidget):
         if self._save(run):
             name = self.state.db.video(mid)["name"]
             self._show_result(f"「{name}」を残します。ほかの {len(targets)} 本を削除候補に追加しました"
-                              "（まだ移動していません。最終確認でごみ箱へ移すかを決めます）")
+                              "（まだ移動していません。最終確認でごみ箱へ移すかを決めます）" if targets else
+                              f"「{name}」を残します。ほかの録画は変えていません")
         self.refresh()
 
     def _decide_all(self, decision: str) -> None:

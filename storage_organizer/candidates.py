@@ -537,10 +537,13 @@ def similar_pair_detail(a_row, b_row) -> dict:
     if not a.get("frames") or not b.get("frames"):
         return {"matched": [], "unmatched": [], "uncomparable": list(range(similar.N_POINTS)), "per_frame": []}
     r = similar.compare(a, b)
-    per = r["per_frame"]
-    return {"matched": [i for i, c in enumerate(per) if c is not None and c >= similar.MATCH_CORR],
-            "unmatched": [i for i, c in enumerate(per) if c is not None and c < similar.MATCH_CORR],
-            "uncomparable": [i for i, c in enumerate(per) if c is None], "per_frame": per}
+    per, ok = r["per_frame"], r.get("per_ok") or [None] * len(r["per_frame"])
+    if not r["per_frame"]:  # 長さが違う（比べていない）
+        return {"matched": [], "unmatched": [], "uncomparable": list(range(similar.N_POINTS)), "per_frame": [],
+                "per_ok": []}
+    return {"matched": [i for i, v in enumerate(ok) if v is True],
+            "unmatched": [i for i, v in enumerate(ok) if v is False],
+            "uncomparable": [i for i, v in enumerate(ok) if v is None], "per_frame": per, "per_ok": ok}
 
 
 def similar_group_detail(rows: dict, members: list[int]) -> dict:

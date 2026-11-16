@@ -22,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import APP_NAME, __version__, autoscan, candidates, media, trash
+from . import APP_NAME, __version__, autoscan, candidates, media, similar, trash
 from .store import Store, StoreError
 
 UI_DIR = Path(__file__).resolve().parent / "web_ui"
@@ -92,6 +92,10 @@ class App:
         self._lock = threading.Lock()
         self._thumb_lock = threading.Semaphore(2)
         self._picker_lock = threading.Lock()
+        self._audio_cache: dict = {}
+        self.port = DEFAULT_PORT
+        self.autostart_registry = None  # テストでは偽の登録先を渡す（None なら Windows のレジストリ）
+        self.shutdown = None            # サーバーを止める処理（main() が設定する）
 
     # --- 共通 -----------------------------------------------------------------
     def tools(self) -> media.FFmpegTools:
@@ -236,8 +240,85 @@ class App:
             keep = (confirmed, "比較して残す1本に選んだ録画") if confirmed else ctx.vgroup_keep[n]
         else:
             kind, members, keep = "single", [mid], (mid, "")
-        return {"kind": kind, "keep_id": keep[0], "keep_reason": keep[1],
-                "items": [self.row_json(ctx.rows[m], ctx) for m in members if m in ctx.rows]}
+        members = [m for m in members if m in ctx.rows]
+        result = {"kind": kind, "keep_id": keep[0], "keep_reason": keep[1],
+                  "items": [self.row_json(ctx.rows[m], ctx) for m in members]}
+        if kind == "similar":
+            result.update(self.scene_table(ctx, members, keep[0]))
+        return result
+
+    def scene_table(self, ctx, members: list[int], keep_id) -> dict:
+        """似た録画の場面ごとの比較（基準の1本と、ほかの録画の同じ位置の場面が一致したか）。
+
+        比較画面で「違う場面」を一覧し、その位置へ飛んで両方を見比べられるようにする。
+        """
+        ref = keep_id if keep_id in members else members[0]
+        ref_row = ctx.rows[ref]
+        dur = candidates.duration(ref_row) or 0
+        n = similar.N_POINTS
+        scenes = [{"index": i, "time": round(dur * (i + 0.5) / n, 2), "status": {str(ref): "ref"}, "corr": {}}
+                  for i in range(n)]
+        differ = set()
+        for m in members:
+            if m == ref:
+                continue
+            d = candidates.similar_pair_detail(ref_row, ctx.rows[m])
+            ok = d.get("per_ok") or [None] * n
+            for i in range(n):
+                v = ok[i] if i < len(ok) else None
+                scenes[i]["status"][str(m)] = "match" if v is True else "differ" if v is False else "unknown"
+                if i < len(d["per_frame"]) and d["per_frame"][i] is not None:
+                    scenes[i]["corr"][str(m)] = d["per_frame"][i]
+                if v is False:
+                    differ.add(i)
+        has_audio = {str(m): bool((candidates.loads(ctx.rows[m]["meta"], {}) or {}).get("has_audio"))
+                     for m in members}
+        return {"reference_id": ref, "scenes": scenes, "differ_scenes": sorted(differ), "has_audio": has_audio,
+                "audio_note": "音声は自動では比べていません。「音声を比べる」で一部の区間を比べるか、"
+                              "両方を再生して聞き比べてください"}
+
+    def audio_check(self, a: int, b: int) -> dict:
+        """2本の音声を数区間だけ比べる（比較画面から押したときだけ。結果はこの起動中だけ覚える）。"""
+        ra, rb = self.db.video(a), self.db.video(b)
+        if not ra or not rb or ra["kind"] != "video" or rb["kind"] != "video":
+            return {"ok": False, "error": "録画が見つかりません"}
+        if ra["missing"] or rb["missing"] or ra["cloud_only"] or rb["cloud_only"]:
+            return {"ok": True, "verdict": "unknown", "reason": "オンライン専用・見つからない録画は音声を比べません",
+                    "windows": [], "matched": 0, "compared": 0}
+        key = (min(a, b), max(a, b), ra["size"], ra["mtime"], rb["size"], rb["mtime"])
+        cached = self._audio_cache.get(key)
+        if cached is None:
+            dur = min(candidates.duration(ra) or 0, candidates.duration(rb) or 0)
+            if dur <= 0:
+                info = media.probe(self.tools(), ra["path"]) if self.tools().available else {}
+                dur = info.get("duration") or 0
+            cached = similar.audio_compare(self.tools(), ra["path"], rb["path"], dur)
+            self._audio_cache[key] = cached
+        return {"ok": True, **cached}
+
+    def scene_image(self, mid: int, index: int) -> str | None:
+        """比較画面の場面の画像（代表場面と同じ位置）。録画は読み取るだけ。作った画像はキャッシュに置く。"""
+        row = self.db.video(mid)
+        if row is None or row["cloud_only"] or row["missing"] or row["kind"] != "video":
+            return None
+        if not 0 <= index < similar.N_POINTS:
+            return None
+        out = str(self.db.thumb_dir / f"s{mid}_{int(row['mtime'])}_{row['size']}_{index}.jpg")
+        if os.path.exists(out):
+            return out
+        tools = self.tools()
+        dur = candidates.duration(row) or 0
+        if not tools.available or dur <= 0:
+            return None
+        t = dur * (index + 0.5) / similar.N_POINTS
+        with self._thumb_lock:
+            tmp = out[:-4] + ".tmp.jpg"
+            cp = media._run([tools.ffmpeg, "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", row["path"], "-frames:v", "1",
+                             "-vf", "scale=240:-2", "-q:v", "5", tmp], None, timeout=60)
+            if cp.returncode != 0 or not os.path.exists(tmp):
+                return None
+            os.replace(tmp, out)
+        return out
 
     # --- 判断 -----------------------------------------------------------------
     def decide(self, ids: list[int], decision) -> dict:
@@ -249,12 +330,27 @@ class App:
         return {"ok": True, "skipped": len(skipped)}
 
     def keep_one(self, keep: int, others: list[int]) -> dict:
-        """この1本を残し、ほかを削除候補にする（まだ移動しない）。保護中は削除候補にしない。"""
-        others = [m for m in others if m != keep and self.db.video(m) and not self.db.video(m)["protected"]]
+        """この1本を残す（まだ移動しない）。
+
+        完全に同じ録画（中身が一致）のときだけ、同じグループのほかのコピーを削除候補にする。
+        似た録画は同じ内容とは限らないので、ほかの録画は変えない（削除候補にするときは録画ごとに選ぶ）。
+        保護中は削除候補にしない。グループ外の ID が送られてきても無視する。
+        """
+        ctx = self.ctx()
+        if keep not in ctx.rows:
+            return {"ok": False, "error": "録画が見つかりません"}
+        if keep in ctx.dup_of:
+            members = set(ctx.dup_groups[ctx.dup_of[keep]])
+            targets = [m for m in others if m != keep and m in members
+                       and self.db.video(m) and not self.db.video(m)["protected"]]
+            kind = "duplicate"
+        else:
+            targets = []
+            kind = "similar" if keep in ctx.vgroup_of else "single"
         self.db.set_decision(keep, "残す")
-        if others:
-            self.db.set_decisions(others, "削除候補")
-        return {"ok": True, "count": len(others)}
+        if targets:
+            self.db.set_decisions(targets, "削除候補")
+        return {"ok": True, "count": len(targets), "kind": kind}
 
     # --- 削除候補・ごみ箱 ---------------------------------------------------------
     def chosen(self) -> dict:
@@ -319,6 +415,27 @@ class App:
         finally:
             self._picker_lock.release()
         return {"ok": True, "path": os.path.normpath(path) if path else ""}
+
+    def autostart_status(self) -> dict:
+        from . import autostart
+        try:
+            return {"ok": True, **autostart.status(self.autostart_registry, self._autostart_port())}
+        except OSError as e:
+            return {"ok": False, "error": f"自動起動の設定を読み取れませんでした: {e}"}
+
+    def set_autostart(self, enabled: bool) -> dict:
+        """利用者が設定画面で選んだときだけ登録・解除する。"""
+        from . import autostart
+        try:
+            fn = autostart.enable if enabled else autostart.disable
+            return {"ok": True, **fn(self.autostart_registry, self._autostart_port())}
+        except autostart.Unsupported as e:
+            return {"ok": False, "error": str(e)}
+        except OSError as e:
+            return {"ok": False, "error": f"自動起動を{'登録' if enabled else '解除'}できませんでした: {e}"}
+
+    def _autostart_port(self) -> int | None:
+        return None if self.port == DEFAULT_PORT else self.port
 
     def settings(self) -> dict:
         tools = self.tools()
@@ -464,8 +581,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.app.trash_status())
             if path == "/api/settings":
                 return self._json(self.app.settings())
+            if path == "/api/autostart":
+                return self._json(self.app.autostart_status())
             if path.startswith("/api/media/"):
                 return self._file(self.app.media_path(int(path.rsplit("/", 1)[1])))
+            if path.startswith("/api/scene/"):
+                _, _, _, mid, idx = path.split("/")
+                return self._file(self.app.scene_image(int(mid), int(idx)), "image/jpeg")
+            if path.startswith("/api/audio/"):
+                _, _, _, a, b = path.split("/")
+                return self._json(self.app.audio_check(int(a), int(b)))
             if path.startswith("/api/thumb/"):
                 return self._file(self.app.thumbnail(int(path.rsplit("/", 1)[1])), "image/jpeg")
         except ValueError:
@@ -532,6 +657,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             if p == "/api/settings":
                 return self._json(self.app.save_settings(data))
+            if p == "/api/autostart":
+                if not isinstance(data.get("enabled"), bool):
+                    raise ValueError("enabled")
+                return self._json(self.app.set_autostart(data["enabled"]))
+            if p == "/api/shutdown":
+                if data.get("confirm") is not True:
+                    return self._error(HTTPStatus.BAD_REQUEST, "確認がありません")
+                if self.app.trash_job and not self.app.trash_job.get("done"):
+                    return self._json({"ok": False, "error": "ごみ箱へ移動している間は終了できません"})
+                if not self.app.shutdown:
+                    return self._json({"ok": False, "error": "この起動方法では画面から終了できません"})
+                self.app.shutdown()
+                return self._json({"ok": True})
             if p == "/api/reveal":
                 return self._json(self.app.reveal(int(data["id"])))
         except StoreError as e:  # 保存できなかったことを、成功したように見せずに伝える
@@ -686,31 +824,66 @@ def _stop_on_signals() -> None:
                 pass
 
 
+def notify_failure(lines: list[str], background: bool) -> None:
+    """起動できなかった理由と直し方を伝える。自動起動（黒い窓なし）のときは Windows の通知ダイアログでも示す。"""
+    for line in lines:
+        print(line)
+    if background and os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, "\n".join(lines), "RecSort を起動できませんでした", 0x30 | 0x40000)
+        except Exception:  # noqa: BLE001  ダイアログを出せなくても、記録（server.log）には残る
+            pass
+
+
+def open_log(data_dir: Path):
+    """自動起動（黒い窓なし）のときの記録先。大きくなったら1世代だけ残して作り直す。"""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    log = data_dir / "server.log"
+    try:
+        if log.exists() and log.stat().st_size > 1024 * 1024:
+            os.replace(log, data_dir / "server.log.1")
+    except OSError:
+        pass
+    fh = open(log, "a", encoding="utf-8", buffering=1)
+    fh.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} 起動 ---\n")
+    return fh
+
+
 def main(argv: list[str] | None = None) -> int:
     from .instance_lock import AlreadyRunning, InstanceLock
     from .store import default_data_dir
     argv = sys.argv[1:] if argv is None else argv
-    open_browser = "--no-browser" not in argv
+    background = "--background" in argv  # ログイン時の自動起動: サーバーだけ（ブラウザを開かない・調査しない）
+    open_browser = "--no-browser" not in argv and not background
+    data_dir = default_data_dir()
+    if background:
+        try:
+            sys.stdout = sys.stderr = open_log(data_dir)
+        except OSError:
+            pass
     try:
         port = _port_from(argv)
     except ValueError:
-        print("--port には番号（例: 8765）を指定してください。")
+        notify_failure(["--port には番号（例: 8765）を指定してください。"], background)
         return 2
     url = f"http://127.0.0.1:{port}/"
+    log_hint = f"詳しい記録: {data_dir / 'server.log'}" if background else ""
 
     # 1. すでに RecSort が動いていれば、その画面を開くだけにする（2つ目は起動しない）
     found = probe(port)
     if found == "recsort":
-        print(f"RecSort はすでに起動しています。開いている画面を表示します: {url}")
+        print(f"RecSort はすでに起動しています。開いている画面を表示します: {url}" if open_browser else
+              f"RecSort はすでに起動しています（2つ目は起動しません）: {url}")
         if open_browser:
             _open_browser(url)
         return 0
     if found == "other":
-        print(f"ポート {port} は別のアプリが使用しているため、RecSort を起動できません。")
-        print("そのアプリを終了するか、別の番号で起動してください（例: RecSortを起動.bat --port 8766）。")
+        notify_failure([f"ポート {port} は別のアプリが使用しているため、RecSort を起動できません。",
+                        "そのアプリを終了してから RecSortを起動.bat をダブルクリックしてください。",
+                        "または別の番号で起動してください（例: RecSortを起動.bat --port 8766）。", log_hint], background)
         return 3
 
-    data_dir = default_data_dir()
     try:  # 保存データを読み書きする前に、二重起動を防ぐロックを取る（デスクトップ版とも共通）
         lock = InstanceLock(data_dir).acquire()
     except AlreadyRunning:
@@ -719,27 +892,40 @@ def main(argv: list[str] | None = None) -> int:
             if open_browser:
                 _open_browser(url)
             return 0
-        print("RecSort はすでに起動しています（デスクトップ版、または別の番号のブラウザ版）。")
-        print("保護や判断の記録が食い違わないよう、同時に2つは起動できません。起動中の RecSort を使ってください。")
+        notify_failure(["RecSort はすでに起動しています（デスクトップ版、または別の番号のブラウザ版）。",
+                        "保護や判断の記録が食い違わないよう、同時に2つは起動できません。",
+                        "起動中の RecSort を終了してから、もう一度起動してください。", log_hint], background)
+        return 1
+    except OSError as e:
+        notify_failure([f"保存先（{data_dir}）を使えないため起動できません: {e}", log_hint], background)
         return 1
     try:
         try:
             db = Store(data_dir)
         except Exception as e:  # noqa: BLE001
-            print(f"保存データを読み込めませんでした（{data_dir}）: {e}")
+            notify_failure([f"保存データを読み込めませんでした（{data_dir}）: {e}",
+                            "保存先のファイルを確認してください（壊れたファイルは .broken-* に退避されます）。", log_hint],
+                           background)
             return 1
         app = App(db)
+        app.port = port
         try:
             server = make_server(app, port)
         except OSError as e:
-            print(f"ポート {port} を使えないため、RecSort を起動できません（{e.strerror or e}）。")
-            print("別のアプリが使用している可能性があります。そのアプリを終了するか、--port で別の番号を指定してください。")
+            notify_failure([f"ポート {port} を使えないため、RecSort を起動できません（{e.strerror or e}）。",
+                            "別のアプリが使用している可能性があります。そのアプリを終了するか、--port で別の番号を指定してください。",
+                            log_hint], background)
             return 3
+        def stop_later():  # 「終了しました」の応答を返してから止める
+            time.sleep(0.3)
+            server.shutdown()
+        app.shutdown = lambda: threading.Thread(target=stop_later, daemon=True).start()
         port = server.server_address[1]
         url = f"http://127.0.0.1:{port}/"
-        print(f"RecSort {__version__} を起動しました: {url}")
+        print(f"RecSort {__version__} を起動しました: {url}" + ("（ログイン時の自動起動）" if background else ""))
         print(f"保存データ: {data_dir}")
-        print("このアドレスをブラウザで開いても使えます。このウィンドウを閉じるか Ctrl+C で終了します。")
+        if not background:
+            print("このアドレスをブラウザで開いても使えます。このウィンドウを閉じるか Ctrl+C で終了します。")
 
         def open_when_ready():  # 応答できる状態になってからブラウザを開く
             if wait_ready(port):
@@ -752,7 +938,7 @@ def main(argv: list[str] | None = None) -> int:
         if not tools.available:
             print("FFmpeg が見つかりません（長さ・黒画面・無音・類似の判定とサムネイルが使えません）。"
                   "例: winget install Gyan.FFmpeg")
-        if db.get_setting("auto_scan_on_start", "1") != "0" and "--no-scan" not in argv:
+        if db.get_setting("auto_scan_on_start", "1") != "0" and "--no-scan" not in argv and not background:
             started = app.start_scan()
             if not started.get("ok"):
                 print("自動調査を始めませんでした: " + str(started.get("error")))
@@ -769,6 +955,7 @@ def main(argv: list[str] | None = None) -> int:
                 app.scan_thread.join(15)
             db.flush_user_state()
             db.save_scan_state()
+            print("RecSort を終了しました。")
         return 0
     finally:
         lock.release()
